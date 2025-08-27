@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from typing import Any, List, Type, Union, Iterable, Optional, cast
 from functools import partial
 from typing_extensions import Literal, overload
@@ -46,6 +47,90 @@ from ...types.responses.response_stream_event import ResponseStreamEvent
 from ...types.responses.response_text_config_param import ResponseTextConfigParam
 
 __all__ = ["Responses", "AsyncResponses"]
+
+
+# --- Internal helper to enforce API contract for reasoning items
+# Some agent handoff / tool-call flows may construct a reasoning item that is not
+# immediately followed by an assistant message. The server currently requires
+# every reasoning item to be followed by a message (containing at least an
+# empty output_text) so we patch the outgoing payload defensively.
+def _ensure_reasoning_followed(body: Any) -> Any:
+    """Ensure each 'reasoning' input item is immediately followed by a valid assistant message.
+
+    Adapted from a community fix idea that patches sequences so the server never
+    sees a lone reasoning item (which would trigger a 400). We do NOT drop
+    reasoning items (to preserve references); instead we append a minimal
+    placeholder assistant message when the next item is missing or of a different type.
+
+    The placeholder mirrors server-produced message IDs (msg_<48 hex chars>) and
+    contains an empty output_text content block (acceptable to the API).
+
+    This function is defensive: on any internal error it returns the original body.
+    """
+    try:
+        if not isinstance(body, dict):
+            return body  # type: ignore[return-value]
+        body_dict = cast(dict[str, Any], body)
+        items_obj: Any = body_dict.get("input")
+        if not isinstance(items_obj, list):
+            return body  # type: ignore[return-value]
+        items: list[Any] = cast(list[Any], items_obj)
+
+        # Collect existing ids to avoid accidental duplication.
+        existing_ids: set[str] = set()
+        for raw in items:
+            if isinstance(raw, dict):
+                _id = cast(dict[str, Any], raw).get("id")
+                if isinstance(_id, str):
+                    existing_ids.add(_id)
+
+        patched: list[Any] = []
+        for idx, raw in enumerate(items):
+            patched.append(raw)
+            if not isinstance(raw, dict):
+                continue
+            typed = cast(dict[str, Any], raw)
+            if typed.get("type") != "reasoning":
+                continue
+
+            nxt = items[idx + 1] if idx + 1 < len(items) else None
+            nxt_type: Optional[str] = None
+            if isinstance(nxt, dict):
+                nxt_type = cast(dict[str, Any], nxt).get("type")  # type: ignore[assignment]
+
+            # If next item already a 'message', we're good.
+            if nxt_type == "message":
+                continue
+
+            # Otherwise append placeholder assistant message.
+            placeholder_id = "msg_placeholder"
+            for _ in range(5):
+                candidate = f"msg_{secrets.token_hex(24)}"
+                if candidate not in existing_ids:
+                    placeholder_id = candidate
+                    existing_ids.add(candidate)
+                    break
+
+            patched.append(
+                {
+                    "id": placeholder_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        }
+                    ],
+                }
+            )
+
+        body_dict["input"] = patched
+        return cast(Any, body_dict)
+    except Exception:
+        return cast(Any, body)  # fail open
 
 
 class Responses(SyncAPIResource):
@@ -811,42 +896,44 @@ class Responses(SyncAPIResource):
         extra_body: Body | None = None,
         timeout: float | httpx.Timeout | None | NotGiven = NOT_GIVEN,
     ) -> Response | Stream[ResponseStreamEvent]:
+        body = maybe_transform(
+            {
+                "background": background,
+                "conversation": conversation,
+                "include": include,
+                "input": input,
+                "instructions": instructions,
+                "max_output_tokens": max_output_tokens,
+                "max_tool_calls": max_tool_calls,
+                "metadata": metadata,
+                "model": model,
+                "parallel_tool_calls": parallel_tool_calls,
+                "previous_response_id": previous_response_id,
+                "prompt": prompt,
+                "prompt_cache_key": prompt_cache_key,
+                "reasoning": reasoning,
+                "safety_identifier": safety_identifier,
+                "service_tier": service_tier,
+                "store": store,
+                "stream": stream,
+                "stream_options": stream_options,
+                "temperature": temperature,
+                "text": text,
+                "tool_choice": tool_choice,
+                "tools": tools,
+                "top_logprobs": top_logprobs,
+                "top_p": top_p,
+                "truncation": truncation,
+                "user": user,
+            },
+            response_create_params.ResponseCreateParamsStreaming
+            if stream
+            else response_create_params.ResponseCreateParamsNonStreaming,
+        )
+        body = _ensure_reasoning_followed(body)
         return self._post(
             "/responses",
-            body=maybe_transform(
-                {
-                    "background": background,
-                    "conversation": conversation,
-                    "include": include,
-                    "input": input,
-                    "instructions": instructions,
-                    "max_output_tokens": max_output_tokens,
-                    "max_tool_calls": max_tool_calls,
-                    "metadata": metadata,
-                    "model": model,
-                    "parallel_tool_calls": parallel_tool_calls,
-                    "previous_response_id": previous_response_id,
-                    "prompt": prompt,
-                    "prompt_cache_key": prompt_cache_key,
-                    "reasoning": reasoning,
-                    "safety_identifier": safety_identifier,
-                    "service_tier": service_tier,
-                    "store": store,
-                    "stream": stream,
-                    "stream_options": stream_options,
-                    "temperature": temperature,
-                    "text": text,
-                    "tool_choice": tool_choice,
-                    "tools": tools,
-                    "top_logprobs": top_logprobs,
-                    "top_p": top_p,
-                    "truncation": truncation,
-                    "user": user,
-                },
-                response_create_params.ResponseCreateParamsStreaming
-                if stream
-                else response_create_params.ResponseCreateParamsNonStreaming,
-            ),
+            body=body,
             options=make_request_options(
                 extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body, timeout=timeout
             ),
@@ -1084,41 +1171,43 @@ class Responses(SyncAPIResource):
                 response=raw_response,
             )
 
+        body = maybe_transform(
+            {
+                "background": background,
+                "conversation": conversation,
+                "include": include,
+                "input": input,
+                "instructions": instructions,
+                "max_output_tokens": max_output_tokens,
+                "max_tool_calls": max_tool_calls,
+                "metadata": metadata,
+                "model": model,
+                "parallel_tool_calls": parallel_tool_calls,
+                "previous_response_id": previous_response_id,
+                "prompt": prompt,
+                "prompt_cache_key": prompt_cache_key,
+                "reasoning": reasoning,
+                "safety_identifier": safety_identifier,
+                "service_tier": service_tier,
+                "store": store,
+                "stream": stream,
+                "stream_options": stream_options,
+                "temperature": temperature,
+                "text": text,
+                "tool_choice": tool_choice,
+                "tools": tools,
+                "top_logprobs": top_logprobs,
+                "top_p": top_p,
+                "truncation": truncation,
+                "user": user,
+                "verbosity": verbosity,
+            },
+            response_create_params.ResponseCreateParams,
+        )
+        body = _ensure_reasoning_followed(body)
         return self._post(
             "/responses",
-            body=maybe_transform(
-                {
-                    "background": background,
-                    "conversation": conversation,
-                    "include": include,
-                    "input": input,
-                    "instructions": instructions,
-                    "max_output_tokens": max_output_tokens,
-                    "max_tool_calls": max_tool_calls,
-                    "metadata": metadata,
-                    "model": model,
-                    "parallel_tool_calls": parallel_tool_calls,
-                    "previous_response_id": previous_response_id,
-                    "prompt": prompt,
-                    "prompt_cache_key": prompt_cache_key,
-                    "reasoning": reasoning,
-                    "safety_identifier": safety_identifier,
-                    "service_tier": service_tier,
-                    "store": store,
-                    "stream": stream,
-                    "stream_options": stream_options,
-                    "temperature": temperature,
-                    "text": text,
-                    "tool_choice": tool_choice,
-                    "tools": tools,
-                    "top_logprobs": top_logprobs,
-                    "top_p": top_p,
-                    "truncation": truncation,
-                    "user": user,
-                    "verbosity": verbosity,
-                },
-                response_create_params.ResponseCreateParams,
-            ),
+            body=body,
             options=make_request_options(
                 extra_headers=extra_headers,
                 extra_query=extra_query,
@@ -2199,42 +2288,44 @@ class AsyncResponses(AsyncAPIResource):
         extra_body: Body | None = None,
         timeout: float | httpx.Timeout | None | NotGiven = NOT_GIVEN,
     ) -> Response | AsyncStream[ResponseStreamEvent]:
+        body = await async_maybe_transform(
+            {
+                "background": background,
+                "conversation": conversation,
+                "include": include,
+                "input": input,
+                "instructions": instructions,
+                "max_output_tokens": max_output_tokens,
+                "max_tool_calls": max_tool_calls,
+                "metadata": metadata,
+                "model": model,
+                "parallel_tool_calls": parallel_tool_calls,
+                "previous_response_id": previous_response_id,
+                "prompt": prompt,
+                "prompt_cache_key": prompt_cache_key,
+                "reasoning": reasoning,
+                "safety_identifier": safety_identifier,
+                "service_tier": service_tier,
+                "store": store,
+                "stream": stream,
+                "stream_options": stream_options,
+                "temperature": temperature,
+                "text": text,
+                "tool_choice": tool_choice,
+                "tools": tools,
+                "top_logprobs": top_logprobs,
+                "top_p": top_p,
+                "truncation": truncation,
+                "user": user,
+            },
+            response_create_params.ResponseCreateParamsStreaming
+            if stream
+            else response_create_params.ResponseCreateParamsNonStreaming,
+        )
+        body = _ensure_reasoning_followed(body)
         return await self._post(
             "/responses",
-            body=await async_maybe_transform(
-                {
-                    "background": background,
-                    "conversation": conversation,
-                    "include": include,
-                    "input": input,
-                    "instructions": instructions,
-                    "max_output_tokens": max_output_tokens,
-                    "max_tool_calls": max_tool_calls,
-                    "metadata": metadata,
-                    "model": model,
-                    "parallel_tool_calls": parallel_tool_calls,
-                    "previous_response_id": previous_response_id,
-                    "prompt": prompt,
-                    "prompt_cache_key": prompt_cache_key,
-                    "reasoning": reasoning,
-                    "safety_identifier": safety_identifier,
-                    "service_tier": service_tier,
-                    "store": store,
-                    "stream": stream,
-                    "stream_options": stream_options,
-                    "temperature": temperature,
-                    "text": text,
-                    "tool_choice": tool_choice,
-                    "tools": tools,
-                    "top_logprobs": top_logprobs,
-                    "top_p": top_p,
-                    "truncation": truncation,
-                    "user": user,
-                },
-                response_create_params.ResponseCreateParamsStreaming
-                if stream
-                else response_create_params.ResponseCreateParamsNonStreaming,
-            ),
+            body=body,
             options=make_request_options(
                 extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body, timeout=timeout
             ),
@@ -2476,41 +2567,43 @@ class AsyncResponses(AsyncAPIResource):
                 response=raw_response,
             )
 
+        body = maybe_transform(
+            {
+                "background": background,
+                "conversation": conversation,
+                "include": include,
+                "input": input,
+                "instructions": instructions,
+                "max_output_tokens": max_output_tokens,
+                "max_tool_calls": max_tool_calls,
+                "metadata": metadata,
+                "model": model,
+                "parallel_tool_calls": parallel_tool_calls,
+                "previous_response_id": previous_response_id,
+                "prompt": prompt,
+                "prompt_cache_key": prompt_cache_key,
+                "reasoning": reasoning,
+                "safety_identifier": safety_identifier,
+                "service_tier": service_tier,
+                "store": store,
+                "stream": stream,
+                "stream_options": stream_options,
+                "temperature": temperature,
+                "text": text,
+                "tool_choice": tool_choice,
+                "tools": tools,
+                "top_logprobs": top_logprobs,
+                "top_p": top_p,
+                "truncation": truncation,
+                "user": user,
+                "verbosity": verbosity,
+            },
+            response_create_params.ResponseCreateParams,
+        )
+        body = _ensure_reasoning_followed(body)
         return await self._post(
             "/responses",
-            body=maybe_transform(
-                {
-                    "background": background,
-                    "conversation": conversation,
-                    "include": include,
-                    "input": input,
-                    "instructions": instructions,
-                    "max_output_tokens": max_output_tokens,
-                    "max_tool_calls": max_tool_calls,
-                    "metadata": metadata,
-                    "model": model,
-                    "parallel_tool_calls": parallel_tool_calls,
-                    "previous_response_id": previous_response_id,
-                    "prompt": prompt,
-                    "prompt_cache_key": prompt_cache_key,
-                    "reasoning": reasoning,
-                    "safety_identifier": safety_identifier,
-                    "service_tier": service_tier,
-                    "store": store,
-                    "stream": stream,
-                    "stream_options": stream_options,
-                    "temperature": temperature,
-                    "text": text,
-                    "tool_choice": tool_choice,
-                    "tools": tools,
-                    "top_logprobs": top_logprobs,
-                    "top_p": top_p,
-                    "truncation": truncation,
-                    "user": user,
-                    "verbosity": verbosity,
-                },
-                response_create_params.ResponseCreateParams,
-            ),
+            body=body,
             options=make_request_options(
                 extra_headers=extra_headers,
                 extra_query=extra_query,
